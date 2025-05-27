@@ -1,7 +1,112 @@
 Description: >
-  MediaSearch Solution - Indexer stack (v0.2.0)
+  MediaSearch Solution - Indexer stack (v0.3.8)
 
 Resources:
+  # This MediaBucket only holds the downloaded YouTube videos
+  YTMediaBucket:
+    Type: AWS::S3::Bucket
+    Description: Create a bucket to hold downloaded YouTube videos 
+  
+
+  # Dynamo DB to hold the indexed YouTube videos along with any Metadata
+  YTMediaDDBQueueTable: 
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: 
+        - 
+          AttributeName: "ytkey"
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "ytkey"
+          KeyType: "HASH"
+
+
+  YTIndexerLambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource: 
+                  - !Join
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref YTMediaBucket
+                      - /*
+                  - !Join
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref YTMediaBucket
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:*'
+                Resource: !GetAtt YTMediaDDBQueueTable.Arn
+  
+  YTDLPLambdalayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      Content: ../layers/yt_dlp
+      CompatibleRuntimes:
+        - python3.11      
+      Description: Layer with yt_dlp package required to download YT Videos
+      LicenseInfo: MIT
+
+     
+  FFMPEGLambdalayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      Content: ../layers/ffmpeg
+      CompatibleRuntimes:
+        - python3.11      
+      Description: Layer with ffmpeg package required to support yt_dlp functions on Lambda
+      LicenseInfo: MIT
+
+  YouTubeVideoIndexer:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Layers: 
+          - !Ref YTDLPLambdalayer
+          - !Ref FFMPEGLambdalayer
+      Code: ../lambda/ytindexer
+      Handler: index.lambda_handler
+      Role: !GetAtt YTIndexerLambdaIAMRole.Arn
+      Runtime: python3.11
+      Timeout: 600
+      MemorySize: 1024
+      Environment: 
+        Variables:
+          playListURL: !Ref PlayListURL
+          numberOfYTVideos: !If [IndexYTVideosYN, 0,!Ref NumberOfYTVideos]
+          LOG_LEVEL: INFO
+          ddbTableName: !Ref YTMediaDDBQueueTable
+          mediaBucket: !Ref YTMediaBucket
+          mediaFolderPrefix: !Ref MediaFolderPrefix
+          metaDataFolderPrefix: !Ref MetadataFolderPrefix
+          RETRY: 10
+
   ##Create the Role needed to create a Kendra Index
   KendraIndexRole:
     Type: 'AWS::IAM::Role'
@@ -49,6 +154,9 @@ Resources:
   ##Create the Kendra Index
   MediaKendraIndex:
     Type: 'AWS::Kendra::Index'
+    DependsOn: 
+      - YouTubeVideoIndexer
+      - CallYouTubeVideoIndexer
     Condition: CreateIndex
     Properties:
       Edition: 'DEVELOPER_EDITION'
@@ -58,11 +166,24 @@ Resources:
           - '-Index'
       RoleArn: !GetAtt KendraIndexRole.Arn
 
-  ##Attach Custom Data Source
+  ##Attach Custom Data Source when using existing Index
+  KendraMediaDSOwn:
+    Type: 'AWS::Kendra::DataSource'
+    Condition: OwnIndex
+    Properties: 
+      IndexId: !Ref ExistingIndexId
+      Name: !Join
+        - ''
+        - - !Ref 'AWS::StackName'
+          - '-DS'
+      Type: 'CUSTOM'
+
+  ##Attach Custom Data Source when using default Index
   KendraMediaDS:
     Type: 'AWS::Kendra::DataSource'
+    Condition: CreateIndex
     Properties: 
-      IndexId: !If [CreateIndex, !GetAtt MediaKendraIndex.Id, !Ref ExistingIndexId]
+      IndexId: !GetAtt MediaKendraIndex.Id
       Name: !Join
         - ''
         - - !Ref 'AWS::StackName'
@@ -97,13 +218,23 @@ Resources:
         - PolicyDocument:
             Version: 2012-10-17
             Statement:
+              - !If    
+                  - NonEmptyBucket
+                  - Effect: Allow
+                    Resource: 
+                      - !Sub 'arn:aws:s3:::${MediaBucket}/*' 
+                      - !Sub 'arn:aws:s3:::${MediaBucket}' 
+                    Action:
+                      - 's3:GetObject'
+                      - 's3:ListBucket'
+                  - !Ref "AWS::NoValue"
               - Effect: Allow
                 Action:
                   - 's3:GetObject'
                   - 's3:ListBucket'
                 Resource: !Sub
                   - 'arn:aws:s3:::${bucket}*'
-                  - bucket: !Ref MediaBucket
+                  - bucket: !Ref YTMediaBucket
           PolicyName: TranscribeDataAccessPolicy
   
   CrawlerLambdaRole:
@@ -130,10 +261,21 @@ Resources:
                     index: !If [CreateIndex, !GetAtt MediaKendraIndex.Id, !Ref ExistingIndexId]
                 Action:
                   - 'kendra:*'
+              - !If    
+                  - NonEmptyBucket
+                  - Effect: Allow
+                    Resource: 
+                      - !Sub 'arn:aws:s3:::${MediaBucket}/*' 
+                      - !Sub 'arn:aws:s3:::${MediaBucket}' 
+                    Action:
+                      - 's3:GetObject'
+                      - 's3:ListBucket'
+                      - 's3:GetBucketLocation'
+                  - !Ref "AWS::NoValue"
               - Effect: Allow
                 Resource: !Sub
                   - 'arn:aws:s3:::${bucket}*'
-                  - bucket: !Ref MediaBucket
+                  - bucket: !Ref YTMediaBucket
                 Action:
                   - 's3:GetObject'
                   - 's3:ListBucket'
@@ -164,22 +306,19 @@ Resources:
       Role: !GetAtt 'CrawlerLambdaRole.Arn'
       Timeout: 900
       MemorySize: 1024
-      Code:
-        S3Bucket: '<ARTIFACT_BUCKET_TOKEN>'
-        S3Key: !Join
-          - ''
-          - - '<ARTIFACT_PREFIX_TOKEN>'
-            - '<INDEXER_ZIPFILE>'
+      Code: ../lambda/indexer
       Environment:
         Variables:
           MEDIA_BUCKET: !Ref MediaBucket
+          YTMEDIA_BUCKET: !Ref YTMediaBucket
           MEDIA_FOLDER_PREFIX: !Ref MediaFolderPrefix
           METADATA_FOLDER_PREFIX: !Ref MetadataFolderPrefix
           MAKE_CATEGORY_FACETABLE: !Ref MakeCategoryFacetable
+          INDEX_YOUTUBE_VIDEOS: !If [IndexYTVideosYN, 'false', 'true'] 
           TRANSCRIBEOPTS_FOLDER_PREFIX: !Ref OptionsFolderPrefix
           MEDIA_FILE_TABLE: !Ref MediaDynamoTable
           INDEX_ID: !If [CreateIndex, !GetAtt MediaKendraIndex.Id, !Ref ExistingIndexId]
-          DS_ID: !GetAtt KendraMediaDS.Id
+          DS_ID: !If [CreateIndex, !GetAtt KendraMediaDS.Id, !GetAtt KendraMediaDSOwn.Id] 
           STACK_NAME: !Ref AWS::StackName
           TRANSCRIBE_ROLE: !GetAtt 'TranscribeDataAccessRole.Arn'
           JOBCOMPLETE_FUNCTION: !Ref S3JobCompletionLambdaFunction
@@ -208,10 +347,21 @@ Resources:
                     index: !If [CreateIndex, !GetAtt MediaKendraIndex.Id, !Ref ExistingIndexId]
                 Action:
                   - 'kendra:*'
+              - !If    
+                  - NonEmptyBucket
+                  - Effect: Allow
+                    Resource: 
+                      - !Sub 'arn:aws:s3:::${MediaBucket}/*' 
+                      - !Sub 'arn:aws:s3:::${MediaBucket}' 
+                    Action:
+                      - 's3:GetObject'
+                      - 's3:ListBucket'
+                      - 's3:GetBucketLocation'
+                  - !Ref "AWS::NoValue"
               - Effect: Allow
                 Resource: !Sub
                   - 'arn:aws:s3:::${bucket}*'
-                  - bucket: !Ref MediaBucket
+                  - bucket: !Ref YTMediaBucket
                 Action:
                   - 's3:GetObject'
                   - 's3:ListBucket'
@@ -234,16 +384,11 @@ Resources:
       Role: !GetAtt 'JobCompleteLambdaRole.Arn'
       Timeout: 300
       MemorySize: 1024
-      Code:
-        S3Bucket: '<ARTIFACT_BUCKET_TOKEN>'
-        S3Key: !Join
-          - ''
-          - - '<ARTIFACT_PREFIX_TOKEN>'
-            - '<INDEXER_ZIPFILE>'
+      Code: ../lambda/indexer
       Environment:
         Variables:
           INDEX_ID: !If [CreateIndex, !GetAtt MediaKendraIndex.Id, !Ref ExistingIndexId]
-          DS_ID: !GetAtt KendraMediaDS.Id
+          DS_ID: !If [CreateIndex, !GetAtt KendraMediaDS.Id, !GetAtt KendraMediaDSOwn.Id] 
           MEDIA_FILE_TABLE: !Ref MediaDynamoTable
           STACK_NAME: !Ref AWS::StackName
 
@@ -298,6 +443,8 @@ Resources:
   StartCrawler:
     Type: Custom::CustomResource
     DependsOn: 
+      - YouTubeVideoIndexer
+      - CallYouTubeVideoIndexer
       - S3CrawlLambdaFunction
       - S3JobCompletionLambdaFunction
       - TrancriptionJobCompleteEvent
@@ -309,8 +456,23 @@ Resources:
         - !Ref MediaFolderPrefix
         - !Ref MetadataFolderPrefix
         - !Ref OptionsFolderPrefix
-        - '<INDEXER_ZIPFILE>'
-    
+        - !Ref S3CrawlLambdaFunction
+        - !Ref S3JobCompletionLambdaFunction
+        - !Ref PlayListURL
+        - !Ref NumberOfYTVideos
+        - !Ref YouTubeVideoIndexer
+
+  CallYouTubeVideoIndexer:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt YouTubeVideoIndexer.Arn
+      TriggerDependencies:
+        - !Ref ExistingIndexId
+        - !Ref MediaBucket
+        - !Ref PlayListURL
+        - !Ref NumberOfYTVideos
+        - !Ref YouTubeVideoIndexer
+
 Parameters:
   MediaBucket:
     Type: String
@@ -348,6 +510,14 @@ Parameters:
     Default: ''
     Type: String
     Description: "Leave this empty to create a new index or provide the index *id* (not name) of the existing Kendra index to be used"
+  PlayListURL:
+    Type: String
+    Description: 'Enter the YouTube playlist URL. Defaulted to This is my Architecture PlayList on Youtube'
+    Default: 'https://www.youtube.com/playlist?list=PLhr1KZpdzukdeX8mQ2qO73bg6UKQHYsHb'
+  NumberOfYTVideos:
+    Type: Number
+    Default: 5
+    Description: 'Enter the number of youtube videos to download. Defaulted to 5'
 
 Metadata:
     AWS::CloudFormation::Interface:
@@ -364,16 +534,39 @@ Metadata:
               Parameters:
                   - MetadataFolderPrefix
                   - OptionsFolderPrefix
+            - Label:
+                default: Index YouTube Videos
+              Parameters:
+                  - PlayListURL
+                  - NumberOfYTVideos
 
-
-    
 Conditions:
+  BlankPlayList: !Equals
+    - !Ref PlayListURL
+    - ''
+  ZeroYTDownload: !Equals
+    - !Ref NumberOfYTVideos
+    - 0
+  IndexYTVideosYN: !Or
+    - !Condition BlankPlayList
+    - !Condition ZeroYTDownload
+
   CreateIndex: !Equals 
     - !Ref ExistingIndexId
     - ''
-    
+
+  OwnIndex: !Not 
+    - !Equals 
+      - !Ref ExistingIndexId
+      - ''
+  NonEmptyBucket: !Not
+    - !Equals 
+      - !Ref MediaBucket
+      - ''
 Outputs:
   KendraIndexId:
     Value: !If [CreateIndex, !GetAtt MediaKendraIndex.Id, !Ref ExistingIndexId]
-  MediaBucketUsed:
-    Value: !Ref MediaBucket
+  MediaBucketsUsed:
+    Value: !If [NonEmptyBucket,  !Join [ ",", [!Ref MediaBucket, !Ref YTMediaBucket]], !Ref YTMediaBucket] 
+  YouTubeMediaBucketUsed:
+    Value: !Ref YTMediaBucket

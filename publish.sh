@@ -1,5 +1,4 @@
 #!/bin/bash
-
 ##############################################################################################
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
@@ -16,7 +15,7 @@
 # export AWS_DEFAULT_REGION=eu-west-1
 ##############################################################################################
 
-USAGE="$0 cfn_bucket cfn_prefix [dflt_media_bucket] [dflt_media_prefix] [dflt_metadata_prefix] [dflt_options_prefix]"
+USAGE="$0 cfn_bucket cfn_prefix [public] [dflt_media_bucket] [dflt_media_prefix] [dflt_metadata_prefix] [dflt_options_prefix]"
 
 BUCKET=$1
 [ -z "$BUCKET" ] && echo "Cfn bucket name is required parameter. Usage $USAGE" && exit 1
@@ -24,14 +23,19 @@ BUCKET=$1
 PREFIX=$2
 [ -z "$PREFIX" ] && echo "Prefix is required parameter. Usage $USAGE" && exit 1
 
-SAMPLES_BUCKET=$3
-SAMPLES_PREFIX=$4
-METADATA_PREFIX=$5
-OPTIONS_PREFIX=$6
+ACL=$3
+if [ "$ACL" == "public" ]; then
+  echo "Published S3 artifacts will be acessible by public (read-only)"
+  PUBLIC=true
+else
+  echo "Published S3 artifacts will NOT be acessible by public."
+  PUBLIC=false
+fi
 
-# Add trailing slash to prefix if needed
-[[ "${PREFIX}" != */ ]] && PREFIX="${PREFIX}/"
-
+SAMPLES_BUCKET=$4
+SAMPLES_PREFIX=$5
+METADATA_PREFIX=$6
+OPTIONS_PREFIX=$7
 
 # Create bucket if it doesn't already exist
 aws s3api list-buckets --query 'Buckets[].Name' | grep "\"$BUCKET\"" > /dev/null 2>&1
@@ -43,6 +47,15 @@ else
   echo "Using existing bucket: $BUCKET"
 fi
 
+# get bucket region for owned accounts
+region=$(aws s3api get-bucket-location --bucket $BUCKET --query "LocationConstraint" --output text) || region="us-east-1"
+[ -z "$region" -o "$region" == "None" ] && region=us-east-1;
+accountid=`aws sts get-caller-identity --query "Account" --output text`
+
+# Assign default values
+[ -z "$SAMPLES_PREFIX" ] && SAMPLES_PREFIX="artifacts/mediasearch/sample-media/"
+[ -z "$METADATA_PREFIX" ] && METADATA_PREFIX="artifacts/mediasearch/sample-metadata/"
+
 echo -n "Make temp dir: "
 timestamp=$(date "+%Y%m%d_%H%M")
 tmpdir=/tmp/mediasearch
@@ -50,85 +63,146 @@ tmpdir=/tmp/mediasearch
 mkdir -p $tmpdir
 pwd
 
-echo "Create timestamped zipfile for lambdas"
-# indexer
-indexerzip=indexer_$timestamp.zip
-pushd lambda/indexer
-zip -r $tmpdir/$indexerzip *.py
-popd
-# build-trigger
-buildtriggerzip=buildtrigger_$timestamp.zip
-pushd lambda/build-trigger
-zip -r $tmpdir/$buildtriggerzip *.py
-popd
-# token-enabler
-tokenenablerzip=tokenenabler_$timestamp.zip
-pushd lambda/token-enabler
-zip -r $tmpdir/$tokenenablerzip *.py
-popd
+# Config
+LAYERS_DIR=$PWD/layers
+FINDER_APP_DIR=$PWD/finderapp
 
-echo "Create zipfile for AWS Amplify/CodeCommit"
+echo "Create zipfile for AWS Amplify/CodeBuild"
+pushd $FINDER_APP_DIR
 finderzip=finder_$timestamp.zip
+amplifybuilder=amplify-build.py
 zip -r $tmpdir/$finderzip ./* -x "node_modules*"
+popd
 
-# get bucket region for owned accounts
-region=$(aws s3api get-bucket-location --bucket $BUCKET --query "LocationConstraint" --output text) || region="us-east-1"
-[ -z "$region" -o "$region" == "None" ] && region=us-east-1;
+# Install yt_dlp and any other pip layers
+echo "------------------------------------------------------------------------------"
+echo "Installing Python packages for AWS Lambda Layers if a requirements.txt is present"
+echo "------------------------------------------------------------------------------"
 
-echo "Inline edit Cfn templates to replace "
-echo "   <ARTIFACT_BUCKET_TOKEN> with bucket name: $BUCKET"
-echo "   <ARTIFACT_PREFIX_TOKEN> with prefix: $PREFIX"
-echo "   <INDEXER_ZIPFILE> with zipfile: $indexerzip"
-echo "   <BUILDTRIGGER_ZIPFILE> with zipfile: $buildtriggerzip"
-echo "   <FINDER_ZIPFILE> with zipfile: $finderzip"
-echo "   <TOKEN_ENABLER_ZIPFILE> with zipfile: $tokenenablerzip"
-echo "   <REGION> with region: $region"
+#pip3 version check. Minimum pip3 version 23
+pip --version | grep -q "^pip 23"
+if [ $? -eq 0 ]; then
+  echo "pip version is greater than or equal to 23.0.0"
+else
+  echo "pip version is less than 23.0.0"
+  pip3 install --upgrade pip
+fi
+
+if [ -d "$LAYERS_DIR" ]; then
+  LAYERS=$(ls $LAYERS_DIR)
+  pushd $LAYERS_DIR
+  for layer in $LAYERS; do
+    if [ -f ${layer}/requirements.txt ]; then
+      echo "Deleting python and bin folder if it exists"
+      [ -d ${layer}/python ] && rm -rf ${layer}/python
+      [ -d ${layer}/bin ] && rm -rf ${layer}/bin
+      echo "Installing packages for: $layer"
+      # ref docs: https://docs.aws.amazon.com/lambda/latest/dg/python-package.html#python-package-pycache
+      pip3 install \
+      --quiet \
+      --platform manylinux2014_x86_64 \
+      --target=package \
+      --implementation cp \
+      --python-version 3.10 \
+      --only-binary=:all: \
+      --no-compile \
+      --requirement ${layer}/requirements.txt \
+      --target=${layer}/python 2>&1 | \
+        grep -v "WARNING: Target directory"
+    echo "Done installing dependencies for $layer"
+    fi
+  done
+  popd
+else
+  echo "Directory $LAYERS_DIR does not exist. Skipping"
+fi
+# Specific to ffmpeg binary to be made avaialble in Lambda runtime
+mkdir -p $LAYERS_DIR/ffmpeg/bin
+wget -P $LAYERS_DIR/ffmpeg https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+tar xvf $LAYERS_DIR/ffmpeg/ffmpeg-master-latest-linux64-gpl.tar.xz -C $LAYERS_DIR/ffmpeg
+rm -rf $LAYERS_DIR/ffmpeg/ffmpeg-master-latest-linux64-gpl.tar.xz*
+cp $LAYERS_DIR/ffmpeg/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg $LAYERS_DIR/ffmpeg/bin/
+rm -rf $LAYERS_DIR/ffmpeg/ffmpeg-master-latest-linux64-gpl
+
 [ -z "$SAMPLES_BUCKET" ] || echo "   <SAMPLES_BUCKET> with bucket name: $SAMPLES_BUCKET"
 [ -z "$SAMPLES_PREFIX" ] || echo "   <SAMPLES_PREFIX> with prefix: $SAMPLES_PREFIX"
 [ -z "$METADATA_PREFIX" ] || echo "   <METADATA_PREFIX> with prefix: $METADATA_PREFIX"
 [ -z "$OPTIONS_PREFIX" ] || echo "   <OPTIONS_PREFIX> with prefix: $OPTIONS_PREFIX"
+
+templates_dir=./cfn-templates
+mkdir -p $templates_dir/out
+[ -d "$LAYERS_DIR" ] && find $LAYERS_DIR -exec touch -d "$(date +%Y-%m-%d)T00:00:00"  '{}' \;
+[ -d "$FINDER_APP_DIR" ] && find $FINDER_APP_DIR -exec touch -d "$(date +%Y-%m-%d)T00:00:00" '{}' \;
+# Initialize Output
+Outputs=""
+
+pushd $templates_dir
 for template in msindexer.yaml msfinder.yaml
 do
-   echo preprocessing $template
-   cat cfn-templates/$template | 
-    sed -e "s%<ARTIFACT_BUCKET_TOKEN>%$BUCKET%g" | 
-    sed -e "s%<ARTIFACT_PREFIX_TOKEN>%$PREFIX%g" |
-    sed -e "s%<INDEXER_ZIPFILE>%$indexerzip%g" |
-    sed -e "s%<BUILDTRIGGER_ZIPFILE>%$buildtriggerzip%g" |
-    sed -e "s%<FINDER_ZIPFILE>%$finderzip%g" |
-    sed -e "s%<TOKEN_ENABLER_ZIPFILE>%$tokenenablerzip%g" |
-    sed -e "s%<SAMPLES_BUCKET>%$SAMPLES_BUCKET%g" |
-    sed -e "s%<SAMPLES_PREFIX>%$SAMPLES_PREFIX%g" |
-    sed -e "s%<METADATA_PREFIX>%$METADATA_PREFIX%g" |
-    sed -e "s%<OPTIONS_PREFIX>%$OPTIONS_PREFIX%g" |
-    sed -e "s%<REGION>%$region%g" > $tmpdir/$template
-done
+  echo "Processing File " ${template}
+  cat $template | 
+  sed -e "s%<ARTIFACT_BUCKET_TOKEN>%$BUCKET%g" | 
+  sed -e "s%<ARTIFACT_PREFIX_TOKEN>%$PREFIX"/"%g" |
+  sed -e "s%<SAMPLES_BUCKET>%$SAMPLES_BUCKET%g" |
+  sed -e "s%<SAMPLES_PREFIX>%$SAMPLES_PREFIX%g" |
+  sed -e "s%<METADATA_PREFIX>%$METADATA_PREFIX%g" |
+  sed -e "s%<OPTIONS_PREFIX>%$OPTIONS_PREFIX%g" |
+  sed -e "s%<FINDER_ZIPFILE>%$finderzip%g" |
+  sed -e "s%<AMPLIFY_BUILDER>%$amplifybuilder%g" |
+  sed -e "s%<REGION>%$region%g" >  deploy_$template
 
-S3PATH=s3://$BUCKET/$PREFIX
-echo "Copy $tmpdir/* to $S3PATH/"
-for f in msfinder.yaml msindexer.yaml $indexerzip $buildtriggerzip $finderzip $tokenenablerzip
-do
-aws s3 cp ${tmpdir}/${f} ${S3PATH}${f} --acl public-read || exit 1
-done
+  S3PATH=s3://$BUCKET/$PREFIX/
+  aws s3 cp ${tmpdir}/${finderzip} ${S3PATH}${finderzip}
 
-# get default media bucket region and warn if it is different than Cfn bucket region
-# media bucket must be in the same region as deployed stack (or Transcribe jobs fail)
-if [ ! -z "$SAMPLES_BUCKET" ]; then
-    dflt_media_region=$(aws s3api get-bucket-location --bucket $SAMPLES_BUCKET --query "LocationConstraint" --output text) || dflt_media_region="us-east-1"
-    [ -z "dflt_media_region" -o "dflt_media_region" == "None" ] && dflt_media_region=us-east-1;
-    if [ "$dflt_media_region" != "$region" ]; then
-        echo "WARNING!!! Default media bucket region ($dflt_media_region) does not match deployment bucket region ($region).. Media bucket ($SAMPLES_BUCKET) must be in same region as deployment bucket ($BUCKET)"
-    fi
+  s3_template=s3://${BUCKET}/${PREFIX}/${template}
+  https_template="https://${BUCKET}.s3.${region}.amazonaws.com/${PREFIX}/${template}"
+  echo "S3 Template " $s3_template
+  echo "HTTPS Template " $https_template
+  aws cloudformation package \
+  --template-file deploy_$template \
+  --output-template-file ./out/${template} \
+  --s3-bucket $BUCKET --s3-prefix $PREFIX \
+  --region ${region} || exit 1
+  echo "Uploading template file to: ${s3_template}"
+  aws s3 cp ./out/${template} ${s3_template}
+  echo "Validating template"
+  aws cloudformation validate-template --template-url ${https_template} > /dev/null || exit 1
+  templateName=${template%.*}
+  templateNameUpper=`echo "$templateName" | awk '{print toupper($0)}'`
+  Outputs=$Outputs${templateNameUpper}" Template URL - $https_template;"
+  
+  Outputs=$Outputs${templateNameUpper}" CF Launch URL - https://${region}.console.aws.amazon.com/cloudformation/home?region=${region}#/stacks/create/review?templateURL=$https_template&stackName=MediaSearch-${templateNameUpper};"
+  rm -rf deploy_$template
+done
+popd
+
+# Copy amplify build helper python
+aws s3 cp $PWD/helper/${amplifybuilder} ${S3PATH}${amplifybuilder}
+
+if $PUBLIC; then
+  echo "Setting public read ACLs on published artifacts"
+  files=$(aws s3api list-objects --bucket ${BUCKET} --prefix ${PREFIX} --query "(Contents)[].[Key]" --output text)
+  for file in $files
+    do
+    echo aws s3api put-object-acl --acl public-read --bucket ${BUCKET} --key $file
+    aws s3api put-object-acl --acl public-read --bucket ${BUCKET} --key $file
+    done
 fi
 
-echo "Outputs"
-indexer_template="https://s3.${region}.amazonaws.com/${BUCKET}/${PREFIX}msindexer.yaml"
-finder_template="https://s3.${region}.amazonaws.com/${BUCKET}/${PREFIX}msfinder.yaml"
-echo Indexer Template URL: $indexer_template
-echo Finder Template URL: $finder_template
-echo Indexer - CF Launch URL: https://${region}.console.aws.amazon.com/cloudformation/home?region=${region}#/stacks/create/review?templateURL=${indexer_template}\&stackName=MediaSearch-Indexer
-echo Finder - CF Launch URL: https://${region}.console.aws.amazon.com/cloudformation/home?region=${region}#/stacks/create/review?templateURL=${finder_template}\&stackName=MediaSearch-Finder
+# Trim trailing :
+Outputs="${Outputs%;}"
+echo
+echo
+echo
+echo -e "===================="
+echo -e "      Outputs       "
+echo -e "===================="
 
-echo Done
-exit 0
+# Print strings   
+IFS=';' read -ra STRINGS <<< "$Outputs"
+for str in "${STRINGS[@]}"; do
+  echo "$str" 
+  echo
+done
 
+echo "Done"
